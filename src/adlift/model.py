@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -123,8 +124,8 @@ class CTRModel:
             ``v3.5_default`` or ``v3_default``.
         thinking_effort: Passed to hosted TabPFN to trade latency for accuracy.
             Leave as ``None`` for the fast path the real-time loop needs.
-        n_estimators: Ensemble size for TabPFN. Small keeps the predictive
-            distribution cheap.
+        n_estimators: Ensemble size for TabPFN. ``None`` keeps each backend's
+            default; a small number makes the predictive distribution cheaper.
         random_state: Seed for the baseline backend.
     """
 
@@ -134,7 +135,7 @@ class CTRModel:
         *,
         model_version: str = "v3.5_default",
         thinking_effort: str | None = None,
-        n_estimators: int = 4,
+        n_estimators: int | None = None,
         random_state: int = 0,
     ) -> None:
         self.backend = resolve_backend(backend)
@@ -147,6 +148,7 @@ class CTRModel:
         self._columns: list[str] = []
         self._vectoriser: Any = None
         self._encoder: Any = None
+        self._client_group_col: str | None = None
         self.report: FitReport | None = None
 
     # -- feature assembly ------------------------------------------------
@@ -243,8 +245,11 @@ class CTRModel:
         Args:
             X: Feature frame. Text columns may be present.
             y: Click-through rates, one per row.
-            groups: Campaign ids. Passed to hosted TabPFN as ``group_col`` so
-                it knows which rows are not independent.
+            groups: Campaign ids. In Thinking mode they are passed to hosted
+                TabPFN as ``group_col`` so its internal validation never splits
+                a campaign, which is what the cookbook prescribes for grouped
+                data. Outside Thinking mode the hosted model has no use for
+                them and they are not sent.
         """
         y = np.asarray(y, dtype=float)
         started = time.perf_counter()
@@ -253,24 +258,34 @@ class CTRModel:
         if self.backend == "client":
             from tabpfn_client import TabPFNRegressor
 
-            kwargs: dict[str, Any] = {
-                "model_path": self.model_version,
-                "n_estimators": self.n_estimators,
-            }
+            kwargs: dict[str, Any] = {"random_state": self.random_state}
+            if self.n_estimators is not None:
+                kwargs["n_estimators"] = self.n_estimators
+            categorical = [
+                index
+                for index, column in enumerate(prepared.columns)
+                if column in CATEGORICAL_COLUMNS
+            ]
+            if categorical:
+                kwargs["categorical_features_indices"] = categorical
+            self._client_group_col = None
             if self.thinking_effort:
                 kwargs["thinking_effort"] = self.thinking_effort
-                kwargs["thinking_metric"] = "rmse"
-            if groups is not None:
-                prepared = prepared.copy()
-                prepared["__group__"] = np.asarray(groups).astype(str)
-                kwargs["group_col"] = "__group__"
-            self._model = _construct_client_regressor(TabPFNRegressor, kwargs)
+                if groups is not None:
+                    prepared = prepared.copy()
+                    prepared["__group__"] = np.asarray(groups).astype(str)
+                    kwargs["group_col"] = "__group__"
+                    self._client_group_col = "__group__"
+            self._model = _construct_client_regressor(TabPFNRegressor, self.model_version, kwargs)
             self._model.fit(prepared, y)
 
         elif self.backend == "local":
             from tabpfn import TabPFNRegressor as LocalRegressor
 
-            self._model = LocalRegressor(n_estimators=self.n_estimators)
+            local_kwargs: dict[str, Any] = {}
+            if self.n_estimators is not None:
+                local_kwargs["n_estimators"] = self.n_estimators
+            self._model = LocalRegressor(**local_kwargs)
             self._model.fit(prepared, y)
 
         else:
@@ -297,15 +312,20 @@ class CTRModel:
         )
         return self
 
+    def _prepared_for_predict(self, X: pd.DataFrame) -> Any:
+        prepared = self._prepare(X, fitting=False)
+        if self.backend == "client" and self._client_group_col:
+            # New creatives belong to no training campaign. The column has to
+            # exist because the model was fitted with it; its value is a
+            # sentinel the model has never seen.
+            prepared = prepared.copy()
+            prepared[self._client_group_col] = "__new__"
+        return prepared
+
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         """Point prediction of click-through rate, clipped to a valid range."""
         started = time.perf_counter()
-        prepared = self._prepare(X, fitting=False)
-        if self.backend == "client" and "__group__" in getattr(
-            self._model, "feature_names_in_", []
-        ):
-            prepared = prepared.copy()
-            prepared["__group__"] = "__new__"
+        prepared = self._prepared_for_predict(X)
         predictions = np.asarray(self._model.predict(prepared), dtype=float).ravel()
         if self.report is not None:
             self.report.predict_seconds = time.perf_counter() - started
@@ -326,39 +346,70 @@ class CTRModel:
         """
         mean = self.predict(X)
         if self.backend == "client":
-            prepared = self._prepare(X, fitting=False)
+            prepared = self._prepared_for_predict(X)
             try:
-                full = self._model.predict(prepared, output_type="full")
-                quantiles = np.asarray(full["quantiles"], dtype=float)
-                levels = np.linspace(0.1, 0.9, quantiles.shape[0])
-                low = quantiles[int(np.argmin(np.abs(levels - lower)))]
-                high = quantiles[int(np.argmin(np.abs(levels - upper)))]
-                return mean, np.clip(low, 0, 1), np.clip(high, 0, 1)
-            except (TypeError, KeyError, ValueError):
+                out = self._model.predict(
+                    prepared, output_type="quantiles", quantiles=[lower, upper]
+                )
+                if isinstance(out, dict):
+                    out = out.get("quantiles", out)
+                arr = np.asarray(out, dtype=float)
+                if arr.ndim == 2 and arr.shape[0] != 2 and arr.shape[1] == 2:
+                    arr = arr.T
+                low, high = arr[0].ravel(), arr[1].ravel()
+                if low.shape == mean.shape:
+                    return mean, np.clip(low, 0, 1), np.clip(high, 0, 1)
+            except (TypeError, KeyError, ValueError, IndexError):
                 pass
         spread = float(np.std(mean)) or 1e-4
         return mean, np.clip(mean - spread, 0, 1), np.clip(mean + spread, 0, 1)
 
 
-def _construct_client_regressor(regressor_cls: Any, kwargs: dict[str, Any]) -> Any:
+#: How this project names hosted models, mapped onto the client's enum.
+_MODEL_VERSION_MEMBERS = {
+    "v3.5_default": "V3_5",
+    "v3.5_fast": "V3_5_FAST",
+    "v3_default": "V3",
+    "v2.6_default": "V2_6",
+    "v2.5_default": "V2_5",
+    "v2_default": "V2",
+}
+
+
+def _construct_client_regressor(
+    regressor_cls: Any, model_version: str, kwargs: dict[str, Any]
+) -> Any:
     """Build a hosted regressor, tolerating client-version differences.
 
-    ``tabpfn-client`` has moved the model selector around between releases.
-    Rather than pin a single spelling, try the documented ones and drop
-    arguments the installed version rejects.
+    The cookbook's preferred spelling is ``create_default_for_version`` with a
+    ``ModelVersion`` member, which also picks that version's default ensemble
+    and inference settings. Older clients take ``model_path`` instead. Try the
+    documented forms in order and drop arguments the installed version
+    rejects, rather than pin one spelling.
     """
-    attempts = [dict(kwargs)]
-    fallback = {k: v for k, v in kwargs.items() if k != "model_path"}
-    attempts.append(fallback)
-    attempts.append(
-        {k: v for k, v in fallback.items() if k not in {"thinking_effort", "thinking_metric"}}
-    )
-    attempts.append({})
+    attempts: list[Callable[[], Any]] = []
+
+    member_name = _MODEL_VERSION_MEMBERS.get(model_version)
+    if member_name and hasattr(regressor_cls, "create_default_for_version"):
+        try:
+            from tabpfn_client.api_models import ModelVersion
+
+            member = getattr(ModelVersion, member_name, None)
+        except ImportError:
+            member = None
+        if member is not None:
+            attempts.append(lambda: regressor_cls.create_default_for_version(member, **kwargs))
+
+    attempts.append(lambda: regressor_cls(model_path=model_version, **kwargs))
+    minimal = {k: v for k, v in kwargs.items() if k not in {"thinking_effort", "group_col"}}
+    attempts.append(lambda: regressor_cls(model_path=model_version, **minimal))
+    attempts.append(lambda: regressor_cls(**minimal))
+    attempts.append(lambda: regressor_cls())
 
     last_error: Exception | None = None
     for attempt in attempts:
         try:
-            return regressor_cls(**attempt)
-        except TypeError as error:  # unexpected keyword for this client version
+            return attempt()
+        except (TypeError, ValueError) as error:  # unsupported keyword or value for this client
             last_error = error
     raise RuntimeError(f"could not construct TabPFN client regressor: {last_error}")
