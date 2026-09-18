@@ -20,6 +20,8 @@ htmlcov/
 # Data and outputs (the demo regenerates these)
 data/*.csv
 reports/results.json
+reports_threads/results.json
+reports_mine/
 *.ipynb_checkpoints/
 
 # OS / editors

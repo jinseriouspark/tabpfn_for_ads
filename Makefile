@@ -9,8 +9,9 @@ setup:            ## Create the virtualenv and install everything (offline-capab
 test:             ## Run the test suite (no network, no keys needed)
 	$(PY) -m pytest -q
 
-demo:             ## Cold-start benchmark + causal report -> reports/
-	$(PY) -m adlift.cli demo --out reports
+demo:             ## Both demos -> reports/ and reports_threads/
+	$(PY) -m adlift.cli demo --spec ads --out reports
+	$(PY) -m adlift.cli demo --spec threads --out reports_threads
 
 lint:
 	$(PY) -m ruff check src tests mcp_server

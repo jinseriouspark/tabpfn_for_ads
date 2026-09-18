@@ -7,7 +7,7 @@ runner = CliRunner()
 
 def test_synth_writes_csv(tmp_path):
     out = tmp_path / "acct.csv"
-    result = runner.invoke(app, ["synth", "--out", str(out), "--n-campaigns", "12"])
+    result = runner.invoke(app, ["synth", "--out", str(out), "--n-groups", "12"])
     assert result.exit_code == 0, result.output
     assert out.exists()
 
@@ -52,7 +52,7 @@ def test_demo_writes_report(tmp_path):
             "20",
             "--n-splits",
             "3",
-            "--n-campaigns",
+            "--n-groups",
             "40",
         ],
     )

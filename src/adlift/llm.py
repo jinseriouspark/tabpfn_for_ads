@@ -15,10 +15,10 @@ so the rest of the package does not care which one.
     network and no keys. It is a stand-in, not a demo of quality.
 
 The constraints passed to ``generate_variants`` are the point of the design.
-The causal analysis tells us *which attributes* of LLM copy hurt performance
-(length, dropped numbers, aspirational tone). Those become hard constraints on
-the rewrite, so the model polishes wording without reintroducing the habits
-that cost clicks.
+The causal and lever analyses say *which attributes* of model-written copy
+hurt performance (length, dropped numbers, aspirational tone, hashtag piles).
+Those become hard constraints on the rewrite, so the model polishes wording
+without reintroducing the habits that cost reach.
 """
 
 from __future__ import annotations
@@ -29,8 +29,6 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-
-from adlift.schema import AdCreative
 
 DEFAULT_MODEL = "claude-opus-5"
 
@@ -53,12 +51,18 @@ BANNER_SCHEMA_HINT = """{
 
 @dataclass(slots=True)
 class RewriteConstraints:
-    """Guard-rails for a rewrite, derived from what the data says hurts."""
+    """Guard-rails for a rewrite, derived from what the data says hurts.
+
+    ``medium`` is ``"ad"`` (headline, body, call to action) or ``"post"`` (one
+    social-post text). ``max_hashtags`` only matters for posts.
+    """
 
     max_words: int = 14
     keep_numeric_claim: bool = True
     keep_cta: bool = True
     tone: str = "direct"
+    max_hashtags: int | None = None
+    medium: str = "ad"
     avoid_words: list[str] = field(
         default_factory=lambda: [
             "discover",
@@ -70,18 +74,24 @@ class RewriteConstraints:
             "effortless",
             "empower",
             "reimagine",
+            "excited to share",
+            "thrilled",
+            "game-changer",
         ]
     )
 
     def as_prompt(self) -> str:
+        scope = "the whole post" if self.medium == "post" else "headline, body and CTA combined"
         lines = [
-            f"- At most {self.max_words} words across headline, body and CTA combined.",
+            f"- At most {self.max_words} words across {scope}.",
             f"- Tone: {self.tone}. Plain claims, no hype.",
         ]
         if self.keep_numeric_claim:
             lines.append("- If the original carries a number, keep a concrete number.")
-        if self.keep_cta:
+        if self.keep_cta and self.medium != "post":
             lines.append("- Keep a short, literal call to action.")
+        if self.max_hashtags is not None:
+            lines.append(f"- At most {self.max_hashtags} hashtags.")
         if self.avoid_words:
             lines.append(f"- Never use these words: {', '.join(self.avoid_words)}.")
         return "\n".join(lines)
@@ -97,9 +107,13 @@ class CopyLLM(Protocol):
         ...
 
     def generate_variants(
-        self, creative: AdCreative, n: int, constraints: RewriteConstraints
+        self, creative: Any, n: int, constraints: RewriteConstraints
     ) -> list[dict[str, str]]:
-        """Write ``n`` rewrites, each a dict with headline, body, cta_text."""
+        """Write ``n`` rewrites, each a dict with headline, body, cta_text.
+
+        ``creative`` is anything with ``headline``, ``body`` and ``cta_text``
+        attributes: an ``AdCreative`` or a ``PostDraft``.
+        """
         ...
 
 
@@ -144,24 +158,34 @@ class StubCopyLLM:
         }
 
     def generate_variants(
-        self, creative: AdCreative, n: int, constraints: RewriteConstraints
+        self, creative: Any, n: int, constraints: RewriteConstraints
     ) -> list[dict[str, str]]:
-        words = [w.strip(".,!?") for w in creative.headline.split()]
+        words = [w.strip(".,!?") for w in str(creative.headline).split() if not w.startswith("#")]
         number = next((w for w in words if any(ch.isdigit() for ch in w)), None)
-        noun = " ".join(words[-2:]) if len(words) >= 2 else creative.headline.strip(".,!?")
+        noun = " ".join(words[-2:]) if len(words) >= 2 else str(creative.headline).strip(".,!?")
         variants = []
         for index in range(n):
             opener = self._OPENERS[index % len(self._OPENERS)]
             headline = f"{opener} {noun}."
             if number and constraints.keep_numeric_claim:
                 headline = f"{opener} {noun} by {number}."
-            variants.append(
-                {
-                    "headline": " ".join(headline.split()[: constraints.max_words]),
-                    "body": "" if index % 2 else "No setup. Cancel anytime.",
-                    "cta_text": creative.cta_text or "Start free",
-                }
-            )
+            if constraints.medium == "post":
+                tail = "" if index % 2 else " Worth it? Yes."
+                variants.append(
+                    {
+                        "headline": " ".join((headline + tail).split()[: constraints.max_words]),
+                        "body": "",
+                        "cta_text": "",
+                    }
+                )
+            else:
+                variants.append(
+                    {
+                        "headline": " ".join(headline.split()[: constraints.max_words]),
+                        "body": "" if index % 2 else "No setup. Cancel anytime.",
+                        "cta_text": getattr(creative, "cta_text", "") or "Start free",
+                    }
+                )
         return variants
 
 
@@ -214,21 +238,34 @@ class ClaudeCopyLLM:
         return parsed
 
     def generate_variants(
-        self, creative: AdCreative, n: int, constraints: RewriteConstraints
+        self, creative: Any, n: int, constraints: RewriteConstraints
     ) -> list[dict[str, str]]:
-        system = (
-            "You write short advertising copy. You follow constraints exactly. "
-            "Reply with a JSON array and nothing else."
-        )
-        prompt = (
-            "Rewrite this ad creative. Keep the offer and the facts; change the wording.\n\n"
-            f"Headline: {creative.headline}\n"
-            f"Body: {creative.body or '(none)'}\n"
-            f"CTA: {creative.cta_text or '(none)'}\n\n"
-            f"Constraints:\n{constraints.as_prompt()}\n\n"
-            f"Return exactly {n} distinct variants as a JSON array of objects with keys "
-            '"headline", "body", "cta_text".'
-        )
+        if constraints.medium == "post":
+            system = (
+                "You write short social-media posts. You follow constraints exactly. "
+                "Reply with a JSON array and nothing else."
+            )
+            prompt = (
+                "Rewrite this post. Keep the point and the facts; change the wording.\n\n"
+                f"Post: {creative.headline}\n\n"
+                f"Constraints:\n{constraints.as_prompt()}\n\n"
+                f"Return exactly {n} distinct variants as a JSON array of objects with keys "
+                '"headline" (the full post text), "body" (empty string), "cta_text" (empty string).'
+            )
+        else:
+            system = (
+                "You write short advertising copy. You follow constraints exactly. "
+                "Reply with a JSON array and nothing else."
+            )
+            prompt = (
+                "Rewrite this ad creative. Keep the offer and the facts; change the wording.\n\n"
+                f"Headline: {creative.headline}\n"
+                f"Body: {creative.body or '(none)'}\n"
+                f"CTA: {creative.cta_text or '(none)'}\n\n"
+                f"Constraints:\n{constraints.as_prompt()}\n\n"
+                f"Return exactly {n} distinct variants as a JSON array of objects with keys "
+                '"headline", "body", "cta_text".'
+            )
         parsed = _parse_json_block(self._ask(system, [{"type": "text", "text": prompt}]))
         if not isinstance(parsed, list):
             raise ValueError("variant generation did not return a JSON array")
