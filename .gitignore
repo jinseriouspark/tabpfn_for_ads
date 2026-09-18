@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Data and outputs (the demo regenerates these)
+data/*.csv
+reports/results.json
+*.ipynb_checkpoints/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
